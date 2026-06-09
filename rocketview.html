@@ -1,0 +1,370 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Flight Logger Console with Board File Browser</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 12px; background:#0b0b0b; color:#eee; }
+    h1 { font-size:1.2rem; margin:0 0 8px 0; }
+    button { margin:4px; padding:6px 10px; background:#222; color:#eee; border:1px solid #444; border-radius:4px; cursor:pointer; }
+    button:disabled { opacity:0.45; cursor:default; }
+    #console { background:#000; color:#0f0; font-family:monospace; padding:8px; height:160px; overflow:auto; border-radius:6px; border:1px solid #222; }
+    #fileList { background:#071; color:#000; padding:6px; border-radius:6px; max-height:160px; overflow:auto; }
+    .fileItem { display:block; padding:6px; margin:4px 0; background:#222; color:#eee; border-radius:4px; cursor:pointer; }
+    .fileItem:hover { background:#333; }
+    #controls { margin:8px 0; }
+    #cmdInput { width:60%; padding:6px; background:#000; color:#eee; border:1px solid #333; border-radius:4px; font-family:monospace; }
+    #chartContainer { margin-top:10px; background:#000; padding:8px; border-radius:6px; border:1px solid #222; }
+    label { font-size:0.9rem; margin-right:8px; }
+  </style>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+</head>
+<body>
+  <h1>Flight Logger Console and Board File Browser</h1>
+
+  <div id="top">
+    <button id="connectBtn">Connect</button>
+    <button id="disconnectBtn" disabled>Disconnect</button>
+    <span id="status">Not connected</span>
+  </div>
+
+  <div id="controls">
+    <button data-cmd="start">start</button>
+    <button data-cmd="stop">stop</button>
+    <button data-cmd="status">status</button>
+    <button id="listFilesBtn">List files on board</button>
+    <button id="refreshFilesBtn" disabled>Refresh files</button>
+    <button id="clearPlotBtn">Clear plot</button>
+    <button id="exportCurrentBtn">Export current file</button>
+    <input id="cmdInput" placeholder="Custom command" />
+    <button id="sendCmdBtn">Send</button>
+  </div>
+
+  <div style="display:flex; gap:12px; align-items:flex-start;">
+    <div style="flex:1;">
+      <div><strong>Console</strong></div>
+      <div id="console"></div>
+    </div>
+
+    <div style="width:260px;">
+      <div><strong>Files on board</strong></div>
+      <div id="fileList">No files listed. Click List files on board.</div>
+      <div style="margin-top:6px; font-size:0.9rem; color:#bbb;">
+        Click a file to download via export. Shift-click to use cat for small files.
+      </div>
+    </div>
+  </div>
+
+  <div id="chartContainer">
+    <div style="margin-bottom:6px;">
+      <label><input type="checkbox" id="livePlot" checked /> Live plot</label>
+      <label><input type="checkbox" id="plotRaw" checked /> raw_alt</label>
+      <label><input type="checkbox" id="plotSmooth" checked /> smooth_alt</label>
+      <label><input type="checkbox" id="plotSpeed" checked /> speed_mph</label>
+    </div>
+    <canvas id="chart" height="220"></canvas>
+  </div>
+
+<script>
+/* Serial state */
+let port = null, reader = null, writer = null, readRunning = false;
+let lineBuffer = '';
+let awaitingExport = false, exportBuffer = '', exportFilename = null;
+
+/* UI refs */
+const connectBtn = document.getElementById('connectBtn');
+const disconnectBtn = document.getElementById('disconnectBtn');
+const statusEl = document.getElementById('status');
+const consoleEl = document.getElementById('console');
+const cmdInput = document.getElementById('cmdInput');
+const sendCmdBtn = document.getElementById('sendCmdBtn');
+const listFilesBtn = document.getElementById('listFilesBtn');
+const refreshFilesBtn = document.getElementById('refreshFilesBtn');
+const fileListEl = document.getElementById('fileList');
+const exportCurrentBtn = document.getElementById('exportCurrentBtn');
+const clearPlotBtn = document.getElementById('clearPlotBtn');
+const livePlotChk = document.getElementById('livePlot');
+const plotRawChk = document.getElementById('plotRaw');
+const plotSmoothChk = document.getElementById('plotSmooth');
+const plotSpeedChk = document.getElementById('plotSpeed');
+
+/* Chart setup */
+const ctx = document.getElementById('chart').getContext('2d');
+const chartData = { labels: [], datasets: [
+  { label:'raw_alt (m)', data:[], borderColor:'rgba(0,200,255,1)', pointRadius:0, hidden:!plotRawChk.checked },
+  { label:'smooth_alt (m)', data:[], borderColor:'rgba(0,255,100,1)', pointRadius:0, hidden:!plotSmoothChk.checked },
+  { label:'speed_mph', data:[], borderColor:'rgba(255,200,0,1)', pointRadius:0, hidden:!plotSpeedChk.checked }
+]};
+const chart = new Chart(ctx, { type:'line', data:chartData, options:{ animation:false, responsive:true, scales:{ x:{ title:{display:true,text:'time (s)'} }, y:{ title:{display:true,text:'value'} } }, plugins:{legend:{labels:{color:'#ddd'}}}}});
+
+function log(s){ consoleEl.textContent += s + '\n'; consoleEl.scrollTop = consoleEl.scrollHeight; }
+function setStatus(s){ statusEl.textContent = s; }
+
+/* Connect / disconnect */
+connectBtn.addEventListener('click', async () => {
+  if (!('serial' in navigator)) { alert('Web Serial not supported'); return; }
+  try {
+    port = await navigator.serial.requestPort({});
+    await port.open({ baudRate: 115200 });
+    const textDecoder = new TextDecoderStream();
+    const textEncoder = new TextEncoderStream();
+    port.readable.pipeTo(textDecoder.writable);
+    textEncoder.readable.pipeTo(port.writable);
+    reader = textDecoder.readable.getReader();
+    writer = textEncoder.writable.getWriter();
+    readRunning = true;
+    readLoop();
+    connectBtn.disabled = true; disconnectBtn.disabled = false; refreshFilesBtn.disabled = false;
+    setStatus('Connected');
+    log('*** Connected ***');
+  } catch (e) { log('Connect error: ' + e); }
+});
+
+disconnectBtn.addEventListener('click', async () => { await disconnect(); });
+
+async function disconnect(){
+  readRunning = false;
+  try { if (reader) { await reader.cancel(); reader.releaseLock(); } } catch(e){}
+  try { if (writer) { await writer.close(); writer.releaseLock(); } } catch(e){}
+  try { if (port) await port.close(); } catch(e){}
+  port = reader = writer = null;
+  connectBtn.disabled = false; disconnectBtn.disabled = true; refreshFilesBtn.disabled = true;
+  setStatus('Not connected');
+  log('*** Disconnected ***');
+}
+
+/* Send command */
+async function sendCommand(cmd){
+  if (!writer) { log('Not connected'); return; }
+  if (!cmd.endsWith('\\n')) cmd += '\\n';
+  try { await writer.write(cmd); log('> ' + cmd.trim()); } catch(e){ log('Write error: ' + e); }
+}
+
+/* Quick command buttons */
+document.querySelectorAll('button[data-cmd]').forEach(b => b.addEventListener('click', () => sendCommand(b.dataset.cmd)));
+sendCmdBtn.addEventListener('click', () => { const c = cmdInput.value.trim(); if (c) { sendCommand(c); cmdInput.value=''; }});
+cmdInput.addEventListener('keydown', e => { if (e.key === 'Enter') sendCmdBtn.click(); });
+
+/* Read loop */
+async function readLoop(){
+  while (readRunning && reader) {
+    try {
+      const { value, done } = await reader.read();
+      if (done) break;
+      if (value) handleIncomingText(value);
+    } catch (e) { log('Read error: ' + e); break; }
+  }
+  await disconnect();
+}
+
+/* Incoming text handling */
+function handleIncomingText(chunk){
+  lineBuffer += chunk;
+  let idx;
+  while ((idx = lineBuffer.indexOf('\\n')) >= 0) {
+    const line = lineBuffer.slice(0, idx+1);
+    lineBuffer = lineBuffer.slice(idx+1);
+    processLine(line.replace(/\\r?\\n$/, ''));
+  }
+}
+
+function processLine(line){
+  // Export capture mode
+  if (awaitingExport) {
+    if (line.startsWith('---BEGIN FILE:')) {
+      const m = line.match(/---BEGIN FILE:\\s*(.+?)---/);
+      exportFilename = m ? m[1].trim() : null;
+      exportBuffer = '';
+      log(line);
+      return;
+    }
+    if (line.startsWith('---END FILE---')) {
+      log(line);
+      awaitingExport = false;
+      downloadExport(exportBuffer, exportFilename || 'flight_export.csv');
+      parseCSVTextAndPlot(exportBuffer);
+      return;
+    }
+    exportBuffer += line + '\\n';
+    return;
+  }
+
+  // Normal console output
+  log(line);
+
+  // Live plot if enabled
+  if (livePlotChk.checked) tryParseDataLine(line);
+
+  // If we are collecting ls results, push into lsCollector
+  if (lsCollector.active) lsCollector.collectLine(line);
+}
+
+/* Export capture helper */
+function downloadExport(text, fname){
+  const blob = new Blob([text], { type:'text/csv' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = fname;
+  document.body.appendChild(a); a.click(); a.remove();
+  URL.revokeObjectURL(url);
+  log('Saved ' + fname);
+}
+
+/* CSV parsing and plotting */
+function tryParseDataLine(line){
+  const parts = line.trim().split(',');
+  if (parts.length !== 4) return false;
+  if (parts[0] === 'time_ms') return false;
+  const t = Number(parts[0]), raw = Number(parts[1]), smooth = Number(parts[2]), speed = Number(parts[3]);
+  if (![t,raw,smooth,speed].every(isFinite)) return false;
+  const t_s = t / 1000.0;
+  chartData.labels.push(t_s);
+  chartData.datasets[0].data.push(raw);
+  chartData.datasets[1].data.push(smooth);
+  chartData.datasets[2].data.push(speed);
+  if (chartData.labels.length > 5000) { chartData.labels.shift(); chartData.datasets.forEach(ds => ds.data.shift()); }
+  chart.update();
+  return true;
+}
+function parseCSVTextAndPlot(text){ chartData.labels.length = 0; chartData.datasets.forEach(ds => ds.data.length = 0); const lines = text.split(/\\r?\\n/); for (const l of lines) tryParseDataLine(l); }
+
+/* File listing on board
+   Strategy:
+   - Send 'ls' command.
+   - Activate lsCollector which collects non-empty lines for a short window (800ms).
+   - After timeout, populate file list UI.
+*/
+const lsCollector = {
+  active: false,
+  lines: [],
+  timer: null,
+  collectLine(line){
+    // ignore known console lines like status messages; assume filenames have no spaces? we'll accept any non-empty line
+    if (line.trim().length === 0) return;
+    this.lines.push(line.trim());
+    // reset timer to allow more lines
+    if (this.timer) clearTimeout(this.timer);
+    this.timer = setTimeout(() => this.finish(), 600);
+  },
+  start(){
+    this.active = true; this.lines = [];
+    // safety timeout in case no output
+    this.timer = setTimeout(() => this.finish(), 800);
+  },
+  finish(){
+    this.active = false;
+    if (this.timer) { clearTimeout(this.timer); this.timer = null; }
+    populateFileList(this.lines);
+  }
+};
+
+listFilesBtn.addEventListener('click', async () => {
+  if (!writer) { log('Not connected'); return; }
+  lsCollector.start();
+  await sendCommand('ls');
+  log('Listing files... waiting for response');
+});
+
+refreshFilesBtn.addEventListener('click', () => { listFilesBtn.click(); });
+
+function populateFileList(lines){
+  if (!lines || lines.length === 0) { fileListEl.textContent = 'No files found.'; return; }
+  // Filter out common console lines if any (e.g., "Using USB REPL..." etc.)
+  const files = lines.filter(l => !l.toLowerCase().includes('using') && !l.toLowerCase().includes('logging') && !l.startsWith('---'));
+  if (files.length === 0) { fileListEl.textContent = 'No files found.'; return; }
+  fileListEl.innerHTML = '';
+  files.forEach(name => {
+    const el = document.createElement('div');
+    el.className = 'fileItem';
+    el.textContent = name;
+    el.title = 'Click to export and download. Shift-click to cat and download.';
+    el.addEventListener('click', async (ev) => {
+      if (!writer) { log('Not connected'); return; }
+      const useCat = ev.shiftKey;
+      if (useCat) {
+        // cat is simpler for small files; capture until a short timeout
+        log('Requesting cat ' + name);
+        // start a temporary capture for cat output
+        captureCat(name);
+        await sendCommand('cat ' + name);
+      } else {
+        // use export which emits BEGIN/END markers
+        awaitingExport = true; exportBuffer = ''; exportFilename = name;
+        log('Requesting export ' + name);
+        await sendCommand('export ' + name);
+      }
+    });
+    fileListEl.appendChild(el);
+  });
+}
+
+/* Capture cat output for small files
+   We'll collect lines for 800ms after the last incoming line and then offer download.
+*/
+let catCapture = { active:false, buffer:'', timer:null, filename:null };
+function captureCat(fname){
+  catCapture.active = true; catCapture.buffer = ''; catCapture.filename = fname;
+  if (catCapture.timer) clearTimeout(catCapture.timer);
+  catCapture.timer = setTimeout(() => finishCatCapture(), 800);
+}
+function finishCatCapture(){
+  if (!catCapture.active) return;
+  catCapture.active = false;
+  if (catCapture.timer) { clearTimeout(catCapture.timer); catCapture.timer = null; }
+  if (catCapture.buffer.length === 0) { log('No data captured from cat.'); return; }
+  downloadExport(catCapture.buffer, catCapture.filename || 'cat_output.txt');
+  parseCSVTextAndPlot(catCapture.buffer);
+}
+function appendCatLine(line){
+  if (!catCapture.active) return;
+  catCapture.buffer += line + '\\n';
+  if (catCapture.timer) clearTimeout(catCapture.timer);
+  catCapture.timer = setTimeout(() => finishCatCapture(), 600);
+}
+
+/* Modify processLine to also feed catCapture */
+const originalProcessLine = processLine;
+processLine = function(line){
+  // If cat capture active and not export mode, append
+  if (catCapture.active && !awaitingExport) {
+    // detect end-of-cat heuristics: if line looks like a prompt or known marker, ignore; otherwise append
+    appendCatLine(line);
+    // still show console
+    log(line);
+    return;
+  }
+  originalProcessLine(line);
+};
+
+/* Export current file button uses 'export' without filename (firmware uses current flight_name) */
+exportCurrentBtn.addEventListener('click', async () => {
+  if (!writer) { log('Not connected'); return; }
+  awaitingExport = true; exportBuffer = ''; exportFilename = null;
+  log('Requesting export (current file)...');
+  await sendCommand('export');
+});
+
+/* Clear plot */
+clearPlotBtn.addEventListener('click', () => { chartData.labels.length = 0; chartData.datasets.forEach(ds => ds.data.length = 0); chart.update(); });
+
+/* Dataset visibility toggles */
+[plotRawChk, plotSmoothChk, plotSpeedChk].forEach(chk => chk.addEventListener('change', () => {
+  chartData.datasets[0].hidden = !plotRawChk.checked;
+  chartData.datasets[1].hidden = !plotSmoothChk.checked;
+  chartData.datasets[2].hidden = !plotSpeedChk.checked;
+  chart.update();
+}));
+
+/* Helper: sendCommand wrapper that returns after write */
+async function sendCommand(cmd){
+  if (!writer) { log('Not connected'); return; }
+  if (!cmd.endsWith('\\n')) cmd += '\\n';
+  try { await writer.write(cmd); log('> ' + cmd.trim()); } catch(e){ log('Write error: ' + e); }
+}
+
+/* Ensure console shows initial hint */
+log('Ready. Connect to your board and click List files on board to browse files.');
+</script>
+</body>
+</html>
