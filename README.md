@@ -1,6 +1,6 @@
 # Altimiter project
 
-This project is to measure the altitude of model rockets with cheap off the shelf devboards. 
+This project is to measure the altitude of model rockets with cheap off the shelf devboards that can run micropython. 
 
 # Rocketview
 Rocketview is a graphical software for sending commands and pulling data off the data loggers
