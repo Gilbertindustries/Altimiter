@@ -2,6 +2,12 @@
 
 This project is to measure the altitude of model rockets with cheap off the shelf devboards. 
 
+# Rocketview
+Rocketview is a graphical software for sending commands and pulling data off the data loggers
+
+Dependencies
+``pip install pyserial matplotlib``
+
 # How to build
 
 # ESP32
